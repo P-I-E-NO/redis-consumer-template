@@ -1,1 +1,0 @@
-pub mod simple_stream_auto_claim_reply;
