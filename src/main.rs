@@ -1,9 +1,8 @@
-use std::{env::var, io::{Empty, Error}};
+use std::env::var;
 use redis::from_redis_value;
 
 use log::{info, error};
-use redis::{Connection, streams::{StreamReadOptions, StreamReadReply, StreamKey, StreamId, StreamClaimOptions, StreamPendingReply, StreamClaimReply}, AsyncCommands, Commands, Value, FromRedisValue, InfoDict, RedisResult, RedisError, ErrorKind};
-use tokio::stream;
+use redis::{streams::{StreamReadOptions, StreamReadReply, StreamKey, StreamId}, Commands, Value, FromRedisValue, ErrorKind};
 
 mod log_util;
 
@@ -43,7 +42,7 @@ async fn main() -> Result<(), anyhow::Error> {
     let mut redis_conn = redis::Client::open(var("REDIS_URL").unwrap()).unwrap().get_connection()?;
 
     let mut alive_stream_keys = ["0-0".to_string()]; // this will be used to process the backlog queue
-    let mut dead_stream_key = "0-0".to_string(); // this will be used to process the backlog queue
+    let mut dead_stream_key = "0-0".to_string(); // this will be used to process the autoclaiming queue
     let stream_name = var("STREAM_NAME").unwrap();
     let streams = [&stream_name.as_str()];
     let notification_group = var("NOTIFICATION_GROUP").unwrap();

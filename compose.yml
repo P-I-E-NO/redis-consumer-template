@@ -37,10 +37,11 @@ services:
   #  environment:
   #    - NOTIFICATION_GROUP=notification_listeners
   #    - CONSUMER_NAME=notifier-1
-  #    - BLOCK_TIME=60
+  #    - BLOCK_TIME=60000 # how much should the consumer block for? 
   #    - STREAM_NAME=streams:notifications
   #    - REDIS_URL=redis://queue
   #    - ITEM_COUNT=10
+  #    - DEAD_KEY_EXPIRY=100000 # how much time should pass before autoclaiming messages?
   #  networks:
   #    - dockerissimo-net
   #  environment:
