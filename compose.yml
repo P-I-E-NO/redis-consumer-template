@@ -42,6 +42,7 @@ services:
   #    - REDIS_URL=redis://queue
   #    - ITEM_COUNT=10
   #    - DEAD_KEY_EXPIRY=100000 # how much time should pass before autoclaiming messages?
+  #    - TELOXIDE_TOKEN=
   #  networks:
   #    - dockerissimo-net
   #  environment:
