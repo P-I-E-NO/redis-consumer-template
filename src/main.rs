@@ -1,150 +1,128 @@
-mod util;
-use std::{env::var, time::{Duration, Instant}, sync::Arc, thread};
+use std::{env::var, time::Duration};
+mod simple_stream_autoclaim_reply;
 
-use redis::{streams::{StreamId, StreamKey}, Value};
-use redis_consumer::{Consumer, ConsumerOptions, ConsumerClaimOptions};
+use deadpool_redis::{Config, Runtime};
 use log::{info, error};
-use teloxide::requests::Requester;
-use tokio::{time::{sleep, sleep_until}};
-use std::sync::Mutex;
+use redis::{streams::{StreamReadOptions, StreamReadReply, StreamKey}, AsyncCommands, Value, RedisError, RedisResult};
+
+use crate::simple_stream_autoclaim_reply::SimpleStreamAutoClaimReply;
+
 
 /*
-    this microservice will simply wait for stream events to happen.
-    once an event (i.e. the fuel-meter places a new item into the stream) happens, this microservice
+    this is a template for a microservice that will simply wait for stream events to happen.
+    once an event (i.e. a new item is placed on the stream) happens, this microservice
     will trigger a routine and will notify the corresponding user
 */
 #[tokio::main]
 async fn main() -> Result<(), anyhow::Error> {
     pretty_env_logger::init();
 
-    let bot = Arc::new(Mutex::new(teloxide::Bot::from_env()));
-    let redis_url = var("REDIS_URL").unwrap(); 
-    let alive_stream_keys = vec!("0-0".to_string()); // this will be used to process the backlog queue
-    let dead_stream_key = "0-0".to_string(); // this will be used to process the autoclaiming queue
+    let cfg = Config::from_url(var("REDIS_URL").unwrap());
+    let redis_pool = cfg.create_pool(Some(Runtime::Tokio1)).unwrap(); 
+    let mut service_connection = redis_pool.get().await.unwrap();
+
+    let mut alive_stream_keys = ["0-0".to_string()]; // this will be used to process the backlog queue
+    let mut dead_stream_key = "0-0".to_string(); // this will be used to process the autoclaiming queue
     let stream_name = var("STREAM_NAME").unwrap();
-    let streams = vec!(stream_name.clone());
+    let streams = [&stream_name.as_str()];
     let notification_group = var("NOTIFICATION_GROUP").unwrap();
     let consumer_name = var("CONSUMER_NAME").unwrap();
     let item_count = var("ITEM_COUNT").unwrap_or("10".to_string()).parse::<usize>().unwrap();
     let block_time = var("BLOCK_TIME").unwrap_or("10000".to_string()).parse::<usize>().unwrap();
     let dead_key_expiry = var("DEAD_KEY_EXPIRY").unwrap_or("10000".to_string()).parse::<usize>().unwrap();
 
-    let consumer = Arc::new(Mutex::new(
-        Consumer::new(
-            redis_url, 
-            consumer_name,
-            streams, 
-            notification_group,
-            alive_stream_keys,
-            dead_stream_key,
-    ).await?));
-
     loop {
 
-        let mut schedule = false;
-        {
-            let mut mutex = consumer.lock().unwrap();
-            let xreadgroup_options = ConsumerOptions::new(item_count, block_time);
-            let items = mutex.simple_read_group(&xreadgroup_options).await.expect("cannot read from group");
-            if items.keys.len() == 0 {
-                // if keys.len() is 0, that means we timed out, meaning there is no
-                // realtime data being pushed on the stream
-                // we use this instant to check if there are any claimable messages
-                println!("timeout reached while waiting for items, searching dead-letter queue");
-                let xautoclaim_options = ConsumerClaimOptions::new(item_count, dead_key_expiry);
-                match mutex.autoclaim(&stream_name, &xautoclaim_options).await {
-                        Ok(v) => {
-                            // the xautoclaim command parsed the output correctly
-                            // this means we might have claimed some items
-                            // if we did, we need to reset the local backlog queue and re-read items from the beginning.
-                            // we also need to update our key pointer to match the latest available key
-                            println!("{}", v.next);
-                            if v.claimed_items != 0 {
-                                println!("claimed {} items", v.claimed_items);
-                            }else{
-                                // println!("no items claimed");
-                            }
-                        },
-                        Err(_) => { error!("error while parsing data from xautoclaim"); },
-                };
-            }else{
-                schedule = true;
-            }
-        }
-
-        /*match consumer.simple_read_group(&xreadgroup_options)
-            .await {
-                Ok(item) => { 
-                    if item.keys.len() == 0 {
-                        // if keys.len() is 0, that means we timed out, meaning there is no
-                        // realtime data being pushed on the stream
-                        // we use this instant to check if there are any claimable messages
-                        println!("timeout reached while waiting for items, searching dead-letter queue");
-                        let xautoclaim_options = ConsumerClaimOptions::new(item_count, dead_key_expiry);
-                        match consumer.autoclaim(&stream_name, &xautoclaim_options).await {
-                                Ok(v) => {
-                                    // the xautoclaim command parsed the output correctly
-                                    // this means we might have claimed some items
-                                    // if we did, we need to reset the local backlog queue and re-read items from the beginning.
-                                    // we also need to update our key pointer to match the latest available key
-                                    println!("{}", v.next);
-                                    if v.claimed_items != 0 {
-                                        println!("claimed {} items", v.claimed_items);
-                                    }else{
-                                        // println!("no items claimed");
-                                    }
-                                },
-                                Err(_) => { error!("error while parsing data from xautoclaim"); },
-                        };
+        let xreadgroup_options = StreamReadOptions::default()
+            .group(&notification_group, &consumer_name)
+            .count(item_count)
+            .block(block_time);
+        
+        if let Ok(reply) = service_connection
+            .xread_options(&streams, &alive_stream_keys, &xreadgroup_options).await as Result<StreamReadReply, RedisError> {
+                if reply.keys.len() == 0 {
+                    // if keys.len() is 0, that means we timed out, meaning there is no
+                    // realtime data being pushed on the stream
+                    // we use this time to check if there are any claimable messages
+                    info!("timeout reached while waiting for items, searching dead-letter queue");
+        
+                    match redis::cmd("xautoclaim")
+                        .arg(&stream_name)
+                        .arg(&notification_group)
+                        .arg(&consumer_name)
+                        .arg(&dead_key_expiry) // key age
+                        .arg(&dead_stream_key)
+                        .arg("COUNT")
+                        .arg(item_count)
+                        .query_async::<_, SimpleStreamAutoClaimReply>(&mut service_connection)
+                        .await {
+                            Ok(v) => {
+                                // the xautoclaim command parsed the output correctly
+                                // this means we might have claimed some items
+                                // if we did, we need to reset the local backlog queue and re-read items from the beginning.
+                                // we also need to update our key pointer to match the 
+                                if v.claimed_items != 0 {
+                                    info!("claimed {} items", v.claimed_items);
+                                    alive_stream_keys[0] = "0-0".to_string(); // we need to reset the backlog queue and reprocess the items 
+                                }
+                                dead_stream_key = v.next.clone(); // we also update
+                            },
+                            Err(_) => { error!("error while parsing data from xautoclaim"); },
+                    };
+                }
+        
+                for StreamKey { key: _, ids } in reply.keys {
+                    // redis will output queued messages until there are
+                    // when there are no queued messages at the given index, redis will output something like:
+                    // 1) 1) "streams:notifications"
+                    // 2) (empty array)
+        
+                    // an empty array means that we processed the entirety of the backlog queue, so we caught up
+                    // any message we didn't process yet.
+                    // this means we can start listening to "new" messages, we do that by using the ">" index
+        
+                    if ids.len() == 0 && alive_stream_keys[0] != ">".to_string() {
+                        // this means we have reached the end of the backlog queue for the given consumer
+                        info!("no queued items for {consumer_name}, listening to realtime data");
+                        alive_stream_keys[0] = ">".to_string();
                     }
                     
-                    consumer.process_group(item, |stream_id| {
-                        let bot = bot.clone();
-                        let c = async_consumer.clone();
-                        Box::pin(async move {
-                            process_item(bot, stream_id, c).await;
-                        })
-                    });
-                    
-                } 
-                Err(e) => {
-                    error!("cannot read group, retrying in 1000ms: {e}");
-                    sleep(Duration::from_secs(1)).await;
+                    for stream_id in ids {
+
+                        let cloned = stream_id.clone();
+                        let group = notification_group.clone();
+                        let cloned_stream_name = stream_name.clone();
+
+                        if let Ok(mut conn) = redis_pool.get().await {
+                            alive_stream_keys[0] = stream_id.id;
+
+                            tokio::spawn(async move {
+                                
+                                info!("processing {}", cloned.id);
+                                tokio::time::sleep(Duration::from_secs(2)).await;
+
+                                if let Ok(_) = conn.xack(&[cloned_stream_name], group, &[cloned.id.to_string()]).await as RedisResult<Value> {
+
+                                    info!("acked message {}", cloned.id);
+
+                                }else{
+                                    error!("cannot ack message {}", cloned.id);
+                                }
+                                                                
+                            });
+
+                        }else{
+                            error!("cannot reserve client connection")
+                        }        
+                        
+                    }
+        
                 }
-            }*/
+            }else{
+                error!("cannot retrieve redis group! retrying...");
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
 
     }
 
 }
-
-/*async fn process_item(
-    bot: Arc<Mutex<teloxide::Bot>>, 
-    item: StreamId,
-    consumer: Arc<Mutex<Consumer>>
-) {
-    // thread::sleep(Duration::from_secs(2));
-    for (_, v) in item.map {
-        if let Value::Data(bytes) = v {
-            let user_id = String::from_utf8(bytes).expect("utf8");
-            {
-                println!("processing {user_id}");
-                {
-                    let mut c = consumer.lock().await;
-                    c.ack(&vec!(item.id.clone())).await.expect("cannot ack");
-                }
-                println!("acked {user_id}");
-                /*let bot = bot.lock().await;
-                match bot.send_message("-1002078353837".to_string(), format!("(ack) user_id: `{user_id}`")).await {
-                    Ok(_) => {
-                        
-                    },
-                    Err(e) => error!("couldn't send telegram message: {e}")
-                }*/
-            }
-            
-        } else {
-            error!("bad redis data")
-        }
-    }
-    
-}*/

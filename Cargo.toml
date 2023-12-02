@@ -20,4 +20,4 @@ thiserror = "1.0.50"
 redis = { version = "0.23.3", features = ["aio", "tokio-comp", "streams"] }
 futures = "0.3.29"
 teloxide = "0.12.2"
-redis-consumer = { git = "https://github.com/P-I-E-NO/redis-consumer", branch = "main" }
+deadpool-redis = "0.13.0"
